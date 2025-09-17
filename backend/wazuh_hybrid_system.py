@@ -2069,5 +2069,3 @@ def validate_system():
 
     print("🎉 Système hybride opérationnel")
     return True
-
-

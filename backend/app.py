@@ -1,18 +1,17 @@
+import os
+import sqlite3
+import hashlib
+import json
+import uuid
+from datetime import datetime, timedelta
+import traceback
+
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-import sqlite3
-import json
-import hashlib
-from datetime import datetime, timedelta
-from collections import defaultdict
-import uuid
-import os
-import traceback
-
 
 from wazuh_hybrid_system import (
-    process_question,   
+    process_question,
     get_mongodb_summary_compact,
     get_total_counts,
     set_processing_limits,
@@ -22,28 +21,31 @@ from wazuh_hybrid_system import (
     load_reranker
 )
 
+# Initialisation de l'application Flask
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('FLASK_SECRET_KEY', 'default-secret-key-for-dev')
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=8)
 
-
+# Configuration CORS pour autoriser les requêtes depuis le frontend
 CORS(app, origins=[
-    "http://localhost:3000",      # Dev local
-    "http://frontend:3000",       # Docker interne
-    "http://127.0.0.1:3000"       # Alternative locale
+    "http://localhost:3000",      # Frontend en développement local
+    "http://frontend:3000",       # Frontend en conteneur Docker
+    "http://127.0.0.1:3000"       # Alternative pour le développement local
 ], supports_credentials=True)
 
-# Configuration Flask-Login
+# Configuration Flask-Login pour la gestion des sessions utilisateur
 login_manager = LoginManager()
 login_manager.init_app(app)
-login_manager.login_view = 'login'
+login_manager.login_view = 'login' # La vue de connexion si l'utilisateur n'est pas authentifié
 
-# Base de données pour l'authentification et l'historique
+# Chemin de la base de données SQLite pour l'authentification et l'historique
 DB_PATH = '/app/database_data/soc_chatbot.db'
 
-# ========== CLASSE USER CORRIGÉE ==========
 class User(UserMixin):
-    """Classe utilisateur pour Flask-Login"""
+    """
+    Représente un utilisateur du système pour Flask-Login.
+    Contient l'ID, le nom d'utilisateur, le nom complet et le rôle de l'utilisateur.
+    """
     def __init__(self, id, username, full_name, role):
         self.id = id
         self.username = username
@@ -51,20 +53,28 @@ class User(UserMixin):
         self.role = role
     
     def get_id(self):
-        """Retourne l'ID utilisateur comme string pour Flask-Login"""
+        """
+        Retourne l'identifiant unique de l'utilisateur sous forme de chaîne.
+        Requis par Flask-Login.
+        """
         return str(self.id)
     
     def __repr__(self):
+        """
+        Représentation textuelle de l'objet User.
+        """
         return f'<User {self.username}>'
 
-# ========== FONCTIONS DE BASE DE DONNÉES ==========
 def init_database():
-    """Initialise la base de données SQLite avec le schéma complet"""
-    # Assurer que le répertoire de la base de données existe
+    """
+    Initialise la base de données SQLite et crée les tables nécessaires
+    (users, conversations, user_limits) si elles n'existent pas.
+    Crée également des utilisateurs par défaut (admin et analyste).
+    """
+    # Assure que le répertoire pour la base de données existe
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     
-    # Table utilisateurs
     conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,7 +87,6 @@ def init_database():
         )
     ''')
     
-    # Table conversations avec TOUTES les colonnes nécessaires
     conn.execute('''
         CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -94,7 +103,6 @@ def init_database():
         )
     ''')
     
-    # Table pour les limites de performance par utilisateur
     conn.execute('''
         CREATE TABLE IF NOT EXISTS user_limits (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106,7 +114,7 @@ def init_database():
         )
     ''')
     
-    # Vérifier et ajouter les colonnes manquantes si la table existe déjà
+    # Vérifie et ajoute les colonnes manquantes à la table 'conversations' si nécessaire
     cursor = conn.cursor()
     try:
         cursor.execute("PRAGMA table_info(conversations)")
@@ -125,16 +133,16 @@ def init_database():
                 cursor.execute(f"ALTER TABLE conversations ADD COLUMN {column_name} {column_def}")
         
     except sqlite3.OperationalError as e:
-        print(f"⚠️ Note: {e}")
+        print(f"⚠️ Note lors de la vérification des colonnes: {e}")
     
-    # Créer un utilisateur admin par défaut
+    # Création de l'utilisateur admin par défaut
     admin_password = hashlib.sha256('admin123'.encode()).hexdigest()
     conn.execute('''
         INSERT OR IGNORE INTO users (username, password_hash, full_name, role) 
         VALUES ('admin', ?, 'Administrateur SOC', 'admin')
     ''', (admin_password,))
     
-    # Créer un analyste par défaut
+    # Création de l'utilisateur analyste par défaut
     analyst_password = hashlib.sha256('analyst123'.encode()).hexdigest()
     conn.execute('''
         INSERT OR IGNORE INTO users (username, password_hash, full_name, role) 
@@ -147,7 +155,10 @@ def init_database():
 
 @login_manager.user_loader
 def load_user(user_id):
-    """Charge un utilisateur par son ID pour Flask-Login"""
+    """
+    Charge un utilisateur à partir de son ID.
+    Utilisé par Flask-Login pour récupérer l'objet utilisateur à partir de la session.
+    """
     try:
         conn = sqlite3.connect(DB_PATH)
         user_data = conn.execute(
@@ -160,11 +171,15 @@ def load_user(user_id):
         return None
         
     except Exception as e:
-        print(f"❌ Erreur load_user: {e}")
+        print(f"❌ Erreur lors du chargement de l'utilisateur {user_id}: {e}")
         return None
 
 def get_user_limits(user_id):
-    """Récupère les limites personnalisées pour un utilisateur"""
+    """
+    Récupère les limites de traitement personnalisées pour un utilisateur donné.
+    Si aucune limite personnalisée n'est définie, retourne des limites par défaut
+    basées sur le rôle de l'utilisateur.
+    """
     conn = sqlite3.connect(DB_PATH)
     limits = conn.execute(
         'SELECT max_query_results, max_rag_docs FROM user_limits WHERE user_id = ?',
@@ -178,21 +193,23 @@ def get_user_limits(user_id):
             'gemini_max_rag_docs': limits[1]
         }
     else:
-        # Limites par défaut selon le rôle
+        # Limites par défaut selon le rôle de l'utilisateur courant
+        # Assurez-vous que current_user est disponible dans le contexte de l'appel
         if hasattr(current_user, 'role') and current_user.role == 'admin':
             return {'max_query_results': 100, 'gemini_max_rag_docs': 5}
         else:
             return {'max_query_results': 50, 'gemini_max_rag_docs': 3}
 
-# ========== ROUTES D'AUTHENTIFICATION ==========
-
 @app.route('/api/login', methods=['POST'])
 def login():
-    """Route de connexion avec gestion d'erreur améliorée"""
+    """
+    Gère la connexion des utilisateurs.
+    Valide les identifiants et établit la session Flask-Login.
+    """
     try:
         data = request.get_json()
         if not data:
-            return jsonify({'error': 'Données JSON requises'}), 400
+            return jsonify({'error': 'Données JSON requises pour la connexion'}), 400
             
         username = data.get('username', '').strip()
         password = data.get('password', '').strip()
@@ -200,10 +217,9 @@ def login():
         if not username or not password:
             return jsonify({'error': 'Nom d\'utilisateur et mot de passe requis'}), 400
         
-        # Hachage du mot de passe
+        # Hachage du mot de passe pour vérification
         password_hash = hashlib.sha256(password.encode()).hexdigest()
         
-        # Recherche de l'utilisateur
         conn = sqlite3.connect(DB_PATH)
         user_data = conn.execute(
             'SELECT id, username, full_name, role FROM users WHERE username = ? AND password_hash = ?',
@@ -211,16 +227,15 @@ def login():
         ).fetchone()
         
         if user_data:
-            # Mettre à jour la dernière connexion
+            # Met à jour le champ last_login
             conn.execute(
                 'UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?',
                 (user_data[0],)
             )
             conn.commit()
             
-            # Créer l'objet utilisateur
             user = User(user_data[0], user_data[1], user_data[2], user_data[3])
-            login_user(user, remember=True)
+            login_user(user, remember=True) # Maintient la session active
             
             conn.close()
             
@@ -237,23 +252,32 @@ def login():
             })
         
         conn.close()
-        print(f"❌ Tentative de connexion échouée pour {username}")
+        print(f"❌ Tentative de connexion échouée pour l'utilisateur: {username}")
         return jsonify({'error': 'Nom d\'utilisateur ou mot de passe incorrect'}), 401
         
     except Exception as e:
-        print(f"❌ Erreur dans login: {e}")
-        return jsonify({'error': 'Erreur interne du serveur'}), 500
+        # Enregistre la trace complète de l'erreur pour le débogage
+        app.logger.error(f"Erreur dans la route /api/login: {traceback.format_exc()}")
+        return jsonify({'error': 'Erreur interne du serveur lors de la connexion'}), 500
 
 @app.route('/api/logout', methods=['POST'])
 @login_required
 def logout():
+    """
+    Déconnecte l'utilisateur courant et met fin à sa session.
+    Nécessite une authentification préalable.
+    """
     logout_user()
+    print("🗑️ Déconnexion réussie.")
     return jsonify({'success': True})
 
 @app.route('/api/user', methods=['GET'])
 @login_required
 def get_current_user():
-    """Récupère les informations de l'utilisateur courant"""
+    """
+    Retourne les informations de l'utilisateur actuellement connecté.
+    Nécessite une authentification préalable.
+    """
     try:
         return jsonify({
             'id': current_user.id,
@@ -263,29 +287,31 @@ def get_current_user():
             'is_authenticated': current_user.is_authenticated
         })
     except Exception as e:
-        print(f"❌ Erreur get_current_user: {e}")
+        app.logger.error(f"Erreur lors de la récupération des informations utilisateur: {traceback.format_exc()}")
         return jsonify({'error': 'Erreur lors de la récupération des données utilisateur'}), 500
-
-# ========== ROUTES PRINCIPALES ==========
 
 @app.route('/api/chat', methods=['POST'])
 @login_required
 def chat():
+    """
+    Traite les requêtes de chat de l'utilisateur, interagit avec le système hybride
+    (MongoDB, RAG, Gemini) et retourne une réponse.
+    Enregistre la conversation dans l'historique.
+    """
     data = request.get_json()
     question = data.get('question', '').strip()
     session_id = data.get('session_id') or str(uuid.uuid4())
-    priority = data.get('priority', 'normal')  # normal, urgent
+    priority = data.get('priority', 'normal') # 'normal' ou 'urgent'
     
     if not question:
-        return jsonify({'error': 'Question requise'}), 400
+        return jsonify({'error': 'Question requise pour le chat'}), 400
     
     try:
-        # Configuration des limites selon l'utilisateur et la priorité
         user_limits = get_user_limits(current_user.id)
         
-        # Ajustement selon la priorité de la requête
+        # Ajuste les limites de traitement en fonction de la priorité de la requête
         if priority == 'urgent':
-            print(f"🚨 Requête URGENTE de {current_user.username}")
+            print(f"🚨 Requête URGENTE de {current_user.username} (Session: {session_id[:8]}...)")
             custom_limits = {
                 **user_limits,
                 'gemini_max_mongodb_results': 10,
@@ -294,50 +320,53 @@ def chat():
         else:
             custom_limits = user_limits
         
-        print(f"⚙️ Limites appliquées pour {current_user.username}: {custom_limits}")
+        print(f"⚙️ Limites appliquées pour {current_user.username} (Rôle: {current_user.role}): {custom_limits}")
         
-        # Appliquer les limites avant traitement
+        # Applique les limites dynamiquement au système hybride avant le traitement
         set_processing_limits(**custom_limits)
         
-        # Traitement avec la version OPTIMISÉE
         start_time = datetime.now()
-        print(f"🔍 Traitement de la question: {question[:100]}...")
+        print(f"🔍 Traitement de la question: {question[:100]}... (Session: {session_id[:8]}...)")
         
-        response = process_question(question, custom_limits)
+        response = process_question(question, custom_limits, session_id)
         
         end_time = datetime.now()
         response_time_ms = int((end_time - start_time).total_seconds() * 1000)
         
-        # Calculer la taille approximative du prompt (pour monitoring)
+        # Calcule la taille approximative du prompt pour le monitoring
         prompt_size = len(question) + len(response)
         
-        # Détecter le type de requête et si c'est critique
         query_type = "general"
         is_critical = False
         
-        # Analyse du contenu de la réponse pour classification
         response_lower = response.lower()
         question_lower = question.lower()
         
-        # Détection du type de requête
+        # Détection du type de requête basée sur des mots-clés
         if any(word in question_lower for word in ["total", "combien", "nombre"]):
             query_type = "count"
-        elif any(word in question_lower for word in ["ssh", "connexion"]):
-            query_type = "ssh_analysis" 
-        elif any(word in question_lower for word in ["critique", "critical"]):
+        elif any(word in question_lower for word in ["ssh", "connexion", "authentification"]):
+            query_type = "authentication_analysis" 
+        elif any(word in question_lower for word in ["critique", "critical", "urgent"]):
             query_type = "critical_alerts"
-        elif any(word in question_lower for word in ["agent"]):
+        elif any(word in question_lower for word in ["agent", "endpoint"]):
             query_type = "agent_status"
-        elif any(word in question_lower for word in ["dernière", "récent"]):
+        elif any(word in question_lower for word in ["dernière", "récent", "historique"]):
             query_type = "recent_activity"
-        
-        # Détection de criticité
+        elif any(word in question_lower for word in ["vulnérabilité", "cve"]):
+            query_type = "vulnerability_scan"
+        elif any(word in question_lower for word in ["fichier", "fim", "intégrité"]):
+            query_type = "fim_changes"
+        elif any(word in question_lower for word in ["malware", "virus", "rootkit"]):
+            query_type = "malware_detection"
+
+        # Détection de la criticité de la réponse
         is_critical = any(keyword in response_lower for keyword in [
             'critique', 'critical', 'urgent', 'niveau 13', 'niveau 14', 'niveau 15',
             'compromis', 'malware', 'breach', 'attack', 'intrusion', 'suspicious'
         ])
         
-        # Sauvegarder dans l'historique avec métadonnées enrichies
+        # Sauvegarde la conversation dans la base de données
         conn = sqlite3.connect(DB_PATH)
         conn.execute('''
             INSERT INTO conversations (session_id, user_id, question, response, 
@@ -348,10 +377,8 @@ def chat():
         conn.commit()
         conn.close()
         
-        # Logging amélioré
-        print(f"✅ Réponse générée en {response_time_ms}ms")
-        print(f"📏 Taille prompt: ~{prompt_size} chars")
-        print(f"🏷️ Type: {query_type}, Critique: {is_critical}")
+        app.logger.info(f"✅ Réponse générée en {response_time_ms}ms pour '{question[:50]}...'")
+        app.logger.info(f"📏 Taille prompt: ~{prompt_size} chars, Type: {query_type}, Critique: {is_critical}")
         
         return jsonify({
             'response': response,
@@ -369,40 +396,39 @@ def chat():
         
     except Exception as e:
         error_trace = traceback.format_exc()
-        print(f"❌ Erreur dans /api/chat: {error_trace}")
+        app.logger.error(f"❌ Erreur dans la route /api/chat pour la question '{question[:50]}...': {error_trace}")
         
-        # Sauvegarder l'erreur pour analyse
+        # Tente de sauvegarder l'erreur dans l'historique
         try:
             conn = sqlite3.connect(DB_PATH)
             conn.execute('''
                 INSERT INTO conversations (session_id, user_id, question, response, 
-                                         response_time_ms, query_type)
-                VALUES (?, ?, ?, ?, ?, ?)
+                                         response_time_ms, query_type, is_critical)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (session_id, current_user.id, question, f"ERREUR: {str(e)}", 
-                  0, "error"))
+                  0, "error", True)) # Marque l'erreur comme critique
             conn.commit()
             conn.close()
-        except:
-            pass  # Si on ne peut pas sauvegarder l'erreur, on continue
+        except Exception as db_err:
+            app.logger.error(f"❌ Impossible de sauvegarder l'erreur dans la DB: {db_err}")
         
         return jsonify({
-            'error': f'Erreur lors du traitement: {str(e)}',
-            'details': 'Vérifiez les logs serveur pour plus de détails'
+            'error': f'Erreur lors du traitement de votre question. Message: {str(e)}',
+            'details': 'Vérifiez les logs du serveur pour plus de détails.'
         }), 500
 
 @app.route('/api/dashboard', methods=['GET'])
 @login_required
 def dashboard():
-    """Dashboard amélioré avec statistiques optimisées"""
+    """
+    Retourne les données agrégées pour le tableau de bord SOC.
+    Inclut un résumé du système, les comptages globaux, les statistiques de conversation
+    et les questions récentes de l'utilisateur.
+    """
     try:
-        # Statistiques MongoDB (version compacte)
-        print("🔧 Récupération du résumé système compact...")
         system_summary = get_mongodb_summary_compact()
-        
-        # Comptages totaux pour affichage
         total_counts = get_total_counts()
         
-        # Statistiques conversations (dernières 24h)
         conn = sqlite3.connect(DB_PATH)
         yesterday = datetime.now() - timedelta(days=1)
         
@@ -417,7 +443,6 @@ def dashboard():
             WHERE created_at >= ?
         ''', (yesterday.strftime('%Y-%m-%d %H:%M:%S'),)).fetchone()
         
-        # Distribution par type de requête
         query_types = conn.execute('''
             SELECT query_type, COUNT(*) as count
             FROM conversations
@@ -426,7 +451,6 @@ def dashboard():
             ORDER BY count DESC
         ''', (yesterday.strftime('%Y-%m-%d %H:%M:%S'),)).fetchall()
         
-        # Top utilisateurs actifs
         top_users = conn.execute('''
             SELECT u.full_name, u.role, COUNT(*) as question_count,
                    AVG(c.response_time_ms) as avg_response_time
@@ -438,7 +462,6 @@ def dashboard():
             LIMIT 5
         ''', (yesterday.strftime('%Y-%m-%d %H:%M:%S'),)).fetchall()
         
-        # Questions récentes de l'utilisateur actuel
         recent_questions = conn.execute('''
             SELECT question, query_type, is_critical, response_time_ms, created_at
             FROM conversations
@@ -449,7 +472,6 @@ def dashboard():
         
         conn.close()
         
-        # Performance du système
         current_limits = get_current_limits()
         
         return jsonify({
@@ -490,14 +512,16 @@ def dashboard():
         })
         
     except Exception as e:
-        error_trace = traceback.format_exc()
-        print(f"❌ Erreur dashboard: {error_trace}")
-        return jsonify({'error': f'Erreur dashboard: {str(e)}'}), 500
+        app.logger.error(f"❌ Erreur dans la route /api/dashboard: {traceback.format_exc()}")
+        return jsonify({'error': f'Erreur lors du chargement du tableau de bord: {str(e)}'}), 500
 
 @app.route('/api/history', methods=['GET'])
 @login_required
 def get_history():
-    """Historique amélioré avec filtres par type de requête"""
+    """
+    Récupère l'historique des conversations pour l'utilisateur courant,
+    avec des options de pagination, recherche et filtrage par type de requête/criticité.
+    """
     try:
         page = request.args.get('page', 1, type=int)
         per_page = request.args.get('per_page', 20, type=int)
@@ -507,10 +531,10 @@ def get_history():
         
         conn = sqlite3.connect(DB_PATH)
         
-        # Construire la requête avec filtres
         where_clause = "WHERE 1=1"
         params = []
         
+        # Les administrateurs peuvent voir toutes les conversations
         if current_user.role != 'admin':
             where_clause += " AND c.user_id = ?"
             params.append(current_user.id)
@@ -526,12 +550,12 @@ def get_history():
         if critical_only:
             where_clause += " AND c.is_critical = 1"
         
-        # Compter le total
+        # Compte le nombre total de conversations pour la pagination
         total = conn.execute(f'''
             SELECT COUNT(*) FROM conversations c {where_clause}
         ''', params).fetchone()[0]
         
-        # Récupérer les conversations paginées
+        # Récupère les conversations paginées
         offset = (page - 1) * per_page
         conversations = conn.execute(f'''
             SELECT c.id, c.question, c.response, c.is_critical, c.created_at, 
@@ -543,7 +567,7 @@ def get_history():
             LIMIT ? OFFSET ?
         ''', params + [per_page, offset]).fetchall()
         
-        # Types de requête disponibles pour le filtre
+        # Récupère les types de requêtes disponibles pour le filtre
         available_types = conn.execute('''
             SELECT DISTINCT query_type, COUNT(*) as count
             FROM conversations c
@@ -579,15 +603,16 @@ def get_history():
         })
         
     except Exception as e:
-        return jsonify({'error': f'Erreur historique: {str(e)}'}), 500
-
-# ========== ROUTES SUPPLÉMENTAIRES ==========
-# (Ajoutez ici les autres routes comme /api/config/limits, /api/export/conversation, etc.)
+        app.logger.error(f"❌ Erreur dans la route /api/history: {traceback.format_exc()}")
+        return jsonify({'error': f'Erreur lors du chargement de l\'historique: {str(e)}'}), 500
 
 @app.route('/api/health', methods=['GET'])
 @login_required
 def health_check():
-    """Vérification de l'état du système"""
+    """
+    Effectue une vérification de l'état de santé du backend et de ses composants critiques.
+    Teste la connectivité à MongoDB et renvoie l'état des services.
+    """
     try:
         health_status = {
             'timestamp': datetime.now().isoformat(),
@@ -595,10 +620,10 @@ def health_check():
             'components': {}
         }
         
-        # Test MongoDB
+        # Test de connectivité MongoDB
         try:
-            db.command('ping')
-            alerts_count = db["alerts"].count_documents({})
+            db.command('ping') # Tente d'envoyer une commande ping à la base de données
+            alerts_count = db["alerts"].count_documents({}) # Compte les documents pour vérifier l'accès
             health_status['components']['mongodb'] = {
                 'status': 'healthy',
                 'alerts_count': alerts_count
@@ -608,14 +633,15 @@ def health_check():
                 'status': 'unhealthy',
                 'error': str(e)
             }
-            health_status['status'] = 'degraded'
+            health_status['status'] = 'degraded' # Dégrade l'état global si MongoDB échoue
         
-        # Configuration actuelle
+        # Ajoute la configuration actuelle du système (limites de traitement)
         health_status['configuration'] = get_current_limits()
         
         return jsonify(health_status)
         
     except Exception as e:
+        app.logger.error(f"❌ Erreur lors de la vérification de santé: {traceback.format_exc()}")
         return jsonify({
             'timestamp': datetime.now().isoformat(),
             'status': 'unhealthy',
@@ -623,15 +649,19 @@ def health_check():
         }), 500
 
 if __name__ == '__main__':
+    # Initialisation de la base de données SQLite
     init_database()
+    # Validation des dépendances et du système hybride (MongoDB, Gemini, ChromaDB)
     validate_system()
+    # Chargement du re-ranker pour la pertinence des résultats RAG
     load_reranker()
+
     print("🚀 === SERVEUR FLASK OPTIMISÉ DÉMARRÉ ===")
     print("🌐 URL: http://localhost:5000")
     print("👤 Comptes par défaut:")
     print("   🔑 Admin: admin / admin123")
     print("   📊 Analyste: analyst / analyst123")
-    print("")
+    print(" ")
     print("🔧 Fonctionnalités optimisées:")
     print("   ⚡ Traitement hybride avec limites intelligentes")
     print("   📊 Dashboard enrichi avec métriques de performance")
