@@ -1,0 +1,69 @@
+services:
+  # Service MongoDB
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 20s
+      retries: 10
+      start_period: 60s
+
+  # Service Data Collecte
+  data_collector:
+    build: 
+      context: ./data_collecte
+      dockerfile: Dockerfile
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    volumes:
+      - ./data_collecte/chroma_db:/app/chroma_db
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/
+      - MONGO_DB_NAME=wazuh_siem
+      - WAZUH_MANAGER_PASSWORD=${WAZUH_MANAGER_PASSWORD}
+      - WAZUH_INDEXER_PASSWORD=${WAZUH_INDEXER_PASSWORD}
+      - WAZUH_MANAGER_USER=wazuh
+      - WAZUH_MANAGER_API_URL=https://192.168.1.100:55000
+      - WAZUH_INDEXER_USER=admin
+      - WAZUH_INDEXER_API_URL=https://192.168.1.100:9200
+      - HUGGINGFACE_MODEL=sentence-transformers/all-MiniLM-L6-v2
+      - VECTOR_DB_DIR=/app/chroma_db
+
+  # Service Backend
+  backend:
+    build: 
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    depends_on:
+      data_collector:
+        condition: service_started
+    volumes:
+      - ./data_collecte/chroma_db:/app/chroma_db:ro
+      - backend_db_data:/app/database_data
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/
+      - MONGO_DB_NAME=wazuh_siem
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+
+  # Service Frontend
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - VITE_API_URL=http://localhost:5000
+
+volumes:
+  mongodb_data:
+  backend_db_data:

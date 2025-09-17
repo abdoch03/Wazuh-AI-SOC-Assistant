@@ -1,0 +1,27 @@
+# Dépendances
+/node_modules
+/backend/venv
+/data_collecte/venv_data
+/frontend/node_modules
+
+# Fichiers compilés/générés
+/__pycache__/
+/backend/__pycache__/
+/data_collecte/__pycache__/
+/frontend/dist/
+
+# Fichiers de configuration sensibles
+.env
+
+# Base de données locales
+/backend/soc_chatbot.db
+/backend/chroma_db/
+/data_collecte/chroma_db/
+
+# Fichiers spécifiques à l'IDE (ex: VS Code, Intellij)
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log

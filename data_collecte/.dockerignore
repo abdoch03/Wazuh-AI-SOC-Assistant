@@ -1,0 +1,7 @@
+venv/
+vlenv_data/
+__pycache__/
+.idea/
+*.pyc
+*.log
+.git/
